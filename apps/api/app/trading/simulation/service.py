@@ -340,7 +340,18 @@ class SimulationService:
         self.session_factory = session_factory or async_session_factory
         self.base_delay = base_delay
         self._sessions: Dict[str, SimulationSession] = {}
-        self._lock = asyncio.Lock()
+        self.__lock: Optional[asyncio.Lock] = None
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        """Lazily initialize asyncio.Lock on the running event loop."""
+        if self.__lock is None:
+            self.__lock = asyncio.Lock()
+        return self.__lock
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        return self._lock
 
     async def create_simulation(
         self,
@@ -476,7 +487,7 @@ class SimulationService:
 
         clock.on_step = _step_hook
 
-        async with self._lock:
+        async with self.lock:
             self._sessions[sim_run.id] = session
 
         return self._build_simulation_response(session, sim_run)
@@ -487,7 +498,7 @@ class SimulationService:
         db: AsyncSession,
     ) -> SimulationResponse:
         """Get authoritative simulation state from active session or database."""
-        async with self._lock:
+        async with self.lock:
             session = self._sessions.get(simulation_id)
 
         if session is not None:
@@ -716,7 +727,7 @@ class SimulationService:
         db: AsyncSession,
     ) -> List[TradeResponse]:
         """Get authoritative executed trades for a simulation."""
-        async with self._lock:
+        async with self.lock:
             session = self._sessions.get(simulation_id)
 
         if session is not None:
@@ -789,7 +800,7 @@ class SimulationService:
         db: AsyncSession,
     ) -> PerformanceMetricsResponse:
         """Get comprehensive performance metrics."""
-        async with self._lock:
+        async with self.lock:
             session = self._sessions.get(simulation_id)
 
         if session is not None:
@@ -834,7 +845,7 @@ class SimulationService:
         db: AsyncSession,
     ) -> List[DecisionResponse]:
         """Get strategy decisions recorded for the simulation."""
-        async with self._lock:
+        async with self.lock:
             session = self._sessions.get(simulation_id)
 
         if session is not None:
@@ -860,7 +871,7 @@ class SimulationService:
         db: AsyncSession,
     ) -> SimulationSession:
         """Lookup active session or raise appropriate 404 / 400."""
-        async with self._lock:
+        async with self.lock:
             session = self._sessions.get(simulation_id)
 
         if session is not None:
@@ -1146,7 +1157,7 @@ class SimulationService:
 _service_instance: Optional[SimulationService] = None
 
 
-def get_simulation_service() -> SimulationService:
+async def get_simulation_service() -> SimulationService:
     """FastAPI dependency providing the singleton SimulationService."""
     global _service_instance
     if _service_instance is None:
