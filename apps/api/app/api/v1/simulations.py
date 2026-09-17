@@ -17,6 +17,7 @@ from app.trading.simulation.schemas import (
     PerformanceMetricsResponse,
     SimulationCreateRequest,
     SimulationResponse,
+    SimulationSpeedRequest,
     TradeResponse,
 )
 from app.trading.simulation.service import SimulationService, get_simulation_service
@@ -131,6 +132,37 @@ async def stop_simulation(
 ) -> SimulationResponse:
     """Stop simulation."""
     return await service.stop_simulation(simulation_id=id, db=db)
+
+
+@router.post(
+    "/{id}/reset",
+    response_model=SimulationResponse,
+    summary="Reset simulation back to initial state",
+    description="Reset simulation clock, portfolio, and replay state back to initial state.",
+)
+async def reset_simulation(
+    id: str,
+    db: AsyncSession = Depends(get_db_session),
+    service: SimulationService = Depends(get_simulation_service),
+) -> SimulationResponse:
+    """Reset simulation."""
+    return await service.reset_simulation(simulation_id=id, db=db)
+
+
+@router.post(
+    "/{id}/speed",
+    response_model=SimulationResponse,
+    summary="Dynamically update simulation playback speed",
+    description="Update playback speed multiplier on active simulation session.",
+)
+async def update_simulation_speed(
+    id: str,
+    req: SimulationSpeedRequest,
+    db: AsyncSession = Depends(get_db_session),
+    service: SimulationService = Depends(get_simulation_service),
+) -> SimulationResponse:
+    """Update speed."""
+    return await service.set_simulation_speed(simulation_id=id, speed=req.speed, db=db)
 
 
 @router.get(

@@ -132,6 +132,7 @@ export interface AgentDecisionPayload {
   take_profit?: number | null;
   reason: string;
   market_regime?: string | null;
+  observations?: string[];
 }
 
 export interface RiskCheckPayload {

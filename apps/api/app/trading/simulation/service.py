@@ -28,6 +28,7 @@ from app.trading.schemas import (
 from app.trading.simulation.clock import (
     InvalidStateTransitionError,
     SimulationClock,
+    SimulationClockError,
     SimulationLifecycleState,
 )
 from app.trading.simulation.replay import (
@@ -117,6 +118,7 @@ class SimulationSession:
         if self.is_baseline:
             if step_res.strategy_orders_queued:
                 for o in step_res.strategy_orders_queued:
+                    reason_str = o.reason or "EMA 9/20 crossover signal"
                     self.decisions.append(
                         {
                             "id": f"dec_{self.simulation_id}_{step_res.step_index}_{o.order_id[:8]}",
@@ -127,8 +129,9 @@ class SimulationSession:
                             "quantity": o.quantity,
                             "stop_loss": o.stop_loss,
                             "take_profit": o.take_profit,
-                            "reason": o.reason or "EMA 9/20 crossover signal",
+                            "reason": reason_str,
                             "market_regime": None,
+                            "observations": [f"Technical signal: {reason_str}"],
                         }
                     )
             else:
@@ -144,6 +147,7 @@ class SimulationSession:
                         "take_profit": None,
                         "reason": "Hold (no crossover signal)",
                         "market_regime": None,
+                        "observations": ["No crossover detected (holding position)"],
                     }
                 )
 
@@ -629,6 +633,83 @@ class SimulationService:
         self._dispatch_complete_event(session, status="STOPPED")
         return self._build_simulation_response(session)
 
+    async def reset_simulation(
+        self,
+        simulation_id: str,
+        db: AsyncSession,
+    ) -> SimulationResponse:
+        """Reset simulation clock, portfolio, and replay state back to initial state."""
+        session = await self._get_active_session(simulation_id, db)
+        try:
+            session.clock.reset()
+        except SimulationClockError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(e),
+            )
+
+        # Clear in-memory decisions and tracking state
+        session.decisions.clear()
+        session.persisted_order_ids.clear()
+        session.persisted_trade_ids.clear()
+        session.persisted_snapshot_timestamps.clear()
+        session.peak_portfolio_value = float(session.initial_capital)
+        session.max_drawdown_pct = 0.0
+
+        # Purge past persisted child records for this simulation from PostgreSQL/SQLite
+        await db.execute(delete(models.Trade).where(models.Trade.simulation_id == simulation_id))
+        await db.execute(delete(models.Order).where(models.Order.simulation_id == simulation_id))
+        await db.execute(
+            delete(models.PortfolioSnapshot).where(
+                models.PortfolioSnapshot.simulation_id == simulation_id
+            )
+        )
+        await db.execute(
+            delete(models.Position).where(models.Position.simulation_id == simulation_id)
+        )
+        await db.commit()
+
+        await session.sync_to_db()
+
+        # Broadcast initial state snapshot to connected WebSocket clients
+        try:
+            from app.websocket.manager import get_connection_manager
+            from app.websocket.schemas import SimulationEventType
+
+            manager = get_connection_manager()
+            if manager.get_active_count(simulation_id) > 0:
+                resp = self._build_simulation_response(session)
+                init_evt = manager.create_event(
+                    simulation_id=simulation_id,
+                    event_type=SimulationEventType.INITIAL_STATE,
+                    virtual_timestamp=resp.current_time.isoformat() if resp.current_time else None,
+                    payload=resp.model_dump(mode="json"),
+                )
+                asyncio.create_task(manager.broadcast(simulation_id, init_evt))
+        except Exception:
+            logger.exception("Error broadcasting reset initial state for %s", simulation_id)
+
+        return self._build_simulation_response(session)
+
+    async def set_simulation_speed(
+        self,
+        simulation_id: str,
+        speed: float,
+        db: AsyncSession,
+    ) -> SimulationResponse:
+        """Dynamically update playback speed multiplier."""
+        session = await self._get_active_session(simulation_id, db)
+        try:
+            session.clock.set_speed(speed)
+        except (ValueError, SimulationClockError) as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(e),
+            )
+
+        await session.sync_to_db()
+        return self._build_simulation_response(session)
+
     async def get_simulation_trades(
         self,
         simulation_id: str,
@@ -968,6 +1049,7 @@ class SimulationService:
                         "take_profit": latest_dec.get("take_profit"),
                         "reason": latest_dec.get("reason", ""),
                         "market_regime": latest_dec.get("market_regime"),
+                        "observations": latest_dec.get("observations", []),
                     },
                 )
                 step_events.append(dec_evt)

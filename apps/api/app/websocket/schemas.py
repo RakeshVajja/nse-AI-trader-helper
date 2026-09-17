@@ -130,6 +130,7 @@ class AgentDecisionPayload(BaseModel):
     take_profit: Optional[float] = None
     reason: str
     market_regime: Optional[str] = None
+    observations: List[str] = Field(default_factory=list)
 
 
 class RiskCheckPayload(BaseModel):

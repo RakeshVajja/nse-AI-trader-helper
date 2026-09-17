@@ -160,3 +160,6 @@ export interface PortfolioState {
 export * from "./agent";
 export * from "./websocket";
 export * from "./chart";
+export * from "./agent-panel";
+export * from "./simulation-terminal";
+export * from "./simulation-controls";

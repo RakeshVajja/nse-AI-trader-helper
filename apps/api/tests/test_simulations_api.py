@@ -876,3 +876,101 @@ async def test_get_endpoints_reflect_persisted_state_when_evicted_from_memory(si
 
     trades_after = (await client.get(f"/api/v1/simulations/{sim_id}/trades")).json()
     assert len(trades_after) == len(trades_before)
+
+
+@pytest.mark.asyncio
+async def test_simulation_speed_endpoint(sim_test_env):
+    """Test POST /api/v1/simulations/{id}/speed dynamically updates speed."""
+    client: AsyncClient = sim_test_env["client"]
+    base_time: datetime = sim_test_env["base_time"]
+    end_time: datetime = sim_test_env["end_time"]
+
+    res = await client.post(
+        "/api/v1/simulations",
+        json={
+            "symbol": "RELIANCE",
+            "start_date": base_time.isoformat(),
+            "end_date": end_time.isoformat(),
+            "speed": 1.0,
+        },
+    )
+    sim_id = res.json()["id"]
+
+    # Valid speed update to 2.0
+    r_speed = await client.post(
+        f"/api/v1/simulations/{sim_id}/speed",
+        json={"speed": 2.0},
+    )
+    assert r_speed.status_code == 200
+    assert r_speed.json()["speed"] == 2.0
+
+    # Valid speed update to 0.5
+    r_speed2 = await client.post(
+        f"/api/v1/simulations/{sim_id}/speed",
+        json={"speed": 0.5},
+    )
+    assert r_speed2.status_code == 200
+    assert r_speed2.json()["speed"] == 0.5
+
+    # Invalid speed update to 3.0
+    r_invalid = await client.post(
+        f"/api/v1/simulations/{sim_id}/speed",
+        json={"speed": 3.0},
+    )
+    assert r_invalid.status_code in (400, 422)
+
+
+@pytest.mark.asyncio
+async def test_simulation_reset_endpoint(sim_test_env):
+    """Test POST /api/v1/simulations/{id}/reset safely resets state when paused."""
+    client: AsyncClient = sim_test_env["client"]
+    base_time: datetime = sim_test_env["base_time"]
+    end_time: datetime = sim_test_env["end_time"]
+
+    res = await client.post(
+        "/api/v1/simulations",
+        json={
+            "symbol": "RELIANCE",
+            "start_date": base_time.isoformat(),
+            "end_date": end_time.isoformat(),
+        },
+    )
+    sim_id = res.json()["id"]
+
+    # Start simulation
+    await client.post(f"/api/v1/simulations/{sim_id}/start")
+
+    # Reset while RUNNING must be rejected (400)
+    r_running_reset = await client.post(f"/api/v1/simulations/{sim_id}/reset")
+    assert r_running_reset.status_code == 400
+
+    # Pause simulation
+    await client.post(f"/api/v1/simulations/{sim_id}/pause")
+
+    # Step forward 3 candles
+    for _ in range(3):
+        await client.post(f"/api/v1/simulations/{sim_id}/step")
+
+    stepped = (await client.get(f"/api/v1/simulations/{sim_id}")).json()
+    assert stepped["step_index"] >= 3
+
+    # Reset while PAUSED must succeed
+    r_reset = await client.post(f"/api/v1/simulations/{sim_id}/reset")
+    assert r_reset.status_code == 200
+    data = r_reset.json()
+    assert data["status"] == "CREATED"
+    assert data["step_index"] == 0
+    assert data["progress_pct"] == 0.0
+
+    # Verify DB trades and performance are clean after reset
+    r_trades = await client.get(f"/api/v1/simulations/{sim_id}/trades")
+    assert r_trades.status_code == 200
+    assert r_trades.json() == []
+
+    r_perf = await client.get(f"/api/v1/simulations/{sim_id}/performance")
+    assert r_perf.status_code == 200
+    perf_data = r_perf.json()
+    assert perf_data["total_trades"] == 0
+    assert perf_data["net_pnl"] == 0.0
+
+

@@ -119,6 +119,26 @@ class SimulationCreateRequest(BaseModel):
         return self
 
 
+class SimulationSpeedRequest(BaseModel):
+    """Payload for dynamically updating simulation playback speed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    speed: float = Field(
+        ...,
+        description="Playback speed multiplier (0.5, 1.0, 2.0, 5.0, 10.0)",
+    )
+
+    @model_validator(mode="after")
+    def validate_speed(self) -> SimulationSpeedRequest:
+        if self.speed not in VALID_PLAYBACK_SPEEDS:
+            speeds_str = ", ".join(str(s) for s in VALID_PLAYBACK_SPEEDS)
+            raise ValueError(
+                f"Unsupported playback speed '{self.speed}'. Supported speeds: {speeds_str}"
+            )
+        return self
+
+
 class SimulationResponse(BaseModel):
     """Detailed response schema representing a historical simulation run."""
 

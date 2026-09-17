@@ -64,12 +64,12 @@
   - [x] 9A: Agent creation modal/form (Strategy prompt, capital, risk parameters)
   - [x] 9B: Mandate review screen with edit & confirmation flow
   - [x] 9C: Agent management API endpoints
-- [ ] **PHASE 10: Complete Trading Dashboard & WebSockets**
+- [x] **PHASE 10: Complete Trading Dashboard & WebSockets**
   - [x] 10A: WebSocket real-time event streaming server & client hook
   - [x] 10B: Quantitative trading terminal layout (Chart + Indicators + Trade Markers)
-  - [ ] 10C: Agent Live Panel (Regime, Signal, Confidence, Observations, Live SL/TP)
-  - [ ] 10D: Activity feed, Trade Log, and Performance panel
-  - [ ] 10E: Interactive simulation controls bar
+  - [x] 10C: Agent Live Panel (Regime, Signal, Confidence, Observations, Live SL/TP)
+  - [x] 10D: Activity feed, Trade Log, and Performance panel
+  - [x] 10E: Interactive simulation controls bar
 - [ ] **PHASE 11: Performance Evaluation & Comparison**
   - [ ] 11A: Comprehensive metrics (Net Return, Win Rate, Profit Factor, Max Drawdown)
   - [ ] 11B: Gemini token & latency tracker
@@ -355,12 +355,13 @@
 - **Total Backend Test Count:** 385/385 passing in 12.15s across 30 test modules.
 
 ## Current Task
-Phase 8E (Agent Failure Handling & Auto-Pause) is complete, audited, and verified **SAFE TO FREEZE**. All 468 backend tests pass, linters/formatters are clean, and frontend compiles with 0 errors. Awaiting user instruction before proceeding to Phase 8F.
+Phase 10 (Complete Trading Dashboard & WebSockets — 10A, 10B, 10C, 10D, 10E) is complete, audited, and frozen. All 527 backend tests and 117 frontend tests pass, typechecks are clean, and Next.js builds with 0 errors. Phase 11 remains untouched and ready to begin upon instruction.
 
 ## Tests & Verification
-- Backend Pytest (`apps/api/tests`): PASS (468/468 tests passed in 13.08s; 28 focused Phase 8E tests)
-- Frontend Build (`apps/web`): PASS (`next build` succeeded, 0 errors)
-- Ruff Lint & Format: PASS (0 errors, all 114 files formatted)
+- Backend Pytest (`apps/api/tests`): PASS (527/527 tests passed, 2 skipped)
+- Frontend Vitest (`apps/web`): PASS (117/117 tests passed across 7 test files)
+- Frontend Typecheck (`tsc`): PASS (0 errors)
+- Frontend Build (`next build`): PASS (0 errors)
 
 ## Known Issues
 - None

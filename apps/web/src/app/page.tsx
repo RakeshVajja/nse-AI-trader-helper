@@ -18,6 +18,9 @@ import { MarketRegimeCard } from "@/components/MarketRegimeBadge";
 import { IndicatorSummaryCard } from "@/components/IndicatorSummaryCard";
 import { AgentCreationModal } from "@/components/AgentCreationModal";
 import { MandateReviewModal } from "@/components/MandateReviewModal";
+import { AgentLivePanel } from "@/components/AgentLivePanel";
+import { BottomTerminalWorkspace } from "@/components/BottomTerminalWorkspace";
+import { SimulationControlsBar } from "@/components/SimulationControlsBar";
 import { useSimulationWebSocket } from "@/hooks/useSimulationWebSocket";
 import {
   fetchHistoricalCandles,
@@ -26,26 +29,54 @@ import {
   fetchInstruments,
   checkBackendHealth,
   generateAgentMandate,
+  fetchSimulationTrades,
+  fetchSimulationPerformance,
+  fetchSimulation,
+  createSimulation,
+  startSimulation,
+  pauseSimulation,
+  resumeSimulation,
+  stepSimulation,
+  stopSimulation,
+  resetSimulation,
+  setSimulationSpeed,
 } from "@/lib/api";
 import {
+  ActivityItem,
   AgentDecisionPayload,
+  AgentLivePanelState,
   AgentMandate,
   AgentMandateCreateRequest,
+  BottomTerminalTab,
   Candle,
   CandleUpdatePayload,
   ChartTradeMarker,
   ConfirmedAgentMandate,
+  createInitialAgentLiveState,
+  formatApiTradeToLogEntry,
+  formatOrderExecutedToTrade,
+  formatSimulationEventToActivity,
   IndicatorSeries,
   IndicatorSnapshot,
   InitialStatePayload,
   Instrument,
   LiveCandleUpdate,
+  mapApiPerformanceToMetrics,
   OrderExecutedPayload,
+  PortfolioUpdatedPayload,
   PositionUpdatedPayload,
+  reduceAgentLiveState,
+  SimulationCompletePayload,
   SimulationEvent,
+  SimulationPerformanceMetrics,
+  SimulationSpeed,
+  SimulationRunMode,
+  SimulationLifecycleStatus,
   Timeframe,
+  TradeLogEntry,
   TradeMarkerType,
 } from "@/types";
+
 
 const DEFAULT_SYMBOLS = [
   "RELIANCE",
@@ -91,16 +122,167 @@ export default function TerminalPage() {
   const [activeTakeProfit, setActiveTakeProfit] = useState<number | null>(null);
   const [liveCandle, setLiveCandle] = useState<LiveCandleUpdate | null>(null);
 
+  // Phase 10C: Agent Live Panel State
+  const [agentLiveState, setAgentLiveState] = useState<AgentLivePanelState>(() =>
+    createInitialAgentLiveState({
+      agentName: "Quantitative Execution Agent",
+      strategyStyle: "MOMENTUM",
+    })
+  );
+
+  // Phase 10D: Activity Feed, Trade Log, and Performance Metrics State
+  const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
+  const [tradeLogEntries, setTradeLogEntries] = useState<TradeLogEntry[]>([]);
+  const [performanceMetrics, setPerformanceMetrics] = useState<SimulationPerformanceMetrics | null>(null);
+  const [bottomTab, setBottomTab] = useState<BottomTerminalTab>("activity");
+
+  // Phase 10E: Interactive Simulation Controls State
+  const [simStatus, setSimStatus] = useState<SimulationLifecycleStatus>("IDLE");
+  const [simSpeed, setSimSpeed] = useState<SimulationSpeed>(1.0);
+  const [simRunMode, setSimRunMode] = useState<SimulationRunMode>("BASELINE");
+  const [simStepIndex, setSimStepIndex] = useState<number>(0);
+  const [simTotalCandles, setSimTotalCandles] = useState<number>(0);
+  const [simProgressPct, setSimProgressPct] = useState<number>(0.0);
+  const [simCurrentTime, setSimCurrentTime] = useState<string | null>(null);
+  const [isSimActionLoading, setIsSimActionLoading] = useState<boolean>(false);
+  const [simErrorMessage, setSimErrorMessage] = useState<string | null>(null);
+
   // WebSocket Event Handler
   const handleSimulationEvent = useCallback((event: SimulationEvent) => {
-    if (activeSimulationId && event.simulation_id !== activeSimulationId) {
+    if (!activeSimulationId || event.simulation_id !== activeSimulationId) {
       return;
     }
+
+    // Authoritatively route simulation event to Agent Live Panel
+    setAgentLiveState((prev) => reduceAgentLiveState(prev, event));
+
+    // Phase 10D: Activity Feed routing (bounded to 200 items, deduped by sequence/event ID)
+    const activityItem = formatSimulationEventToActivity(event);
+    if (activityItem) {
+      setActivityItems((prev) => {
+        if (prev.some((it) => it.id === activityItem.id)) return prev;
+        const next = [...prev, activityItem];
+        return next.length > 200 ? next.slice(next.length - 200) : next;
+      });
+    }
+
+    // Phase 10D: Order Executed -> Trade Log routing (FILLED only, strictly no signals)
+    if (event.event_type === "order_executed") {
+      const p = event.payload as OrderExecutedPayload;
+      if (p && p.status === "FILLED") {
+        const tradeEntry = formatOrderExecutedToTrade(event, selectedSymbol);
+        if (tradeEntry) {
+          setTradeLogEntries((prev) => {
+            if (prev.some((t) => t.id === tradeEntry.id)) return prev;
+            return [...prev, tradeEntry];
+          });
+        }
+      }
+    }
+
+
+    // Phase 10D: Live Portfolio & Settled Performance routing
+    if (event.event_type === "portfolio_updated") {
+      const p = event.payload as PortfolioUpdatedPayload;
+      if (p) {
+        setPerformanceMetrics((prev) => {
+          const base: SimulationPerformanceMetrics = prev || {
+            simulationId: event.simulation_id,
+            initialCapital: 100000,
+            finalPortfolioValue: p.portfolio_value,
+            grossPnl: p.gross_pnl,
+            netPnl: p.net_pnl,
+            totalReturnPct: p.total_return_pct,
+            transactionCosts: 0,
+            slippageCost: 0,
+            totalTrades: 0,
+            winningTrades: 0,
+            losingTrades: 0,
+            winRatePct: 0,
+            averageWin: 0,
+            averageLoss: 0,
+            profitFactor: 0,
+            maxDrawdownPct: 0,
+            exposurePct: p.exposure_pct,
+            openPositionsCount: p.open_positions_count,
+          };
+          return {
+            ...base,
+            finalPortfolioValue: p.portfolio_value,
+            grossPnl: p.gross_pnl,
+            netPnl: p.net_pnl,
+            totalReturnPct: p.total_return_pct,
+            exposurePct: p.exposure_pct,
+            openPositionsCount: p.open_positions_count,
+          };
+        });
+      }
+    } else if (event.event_type === "simulation_complete") {
+      const p = event.payload as SimulationCompletePayload;
+      const completionStatus = (p?.status as SimulationLifecycleStatus) || "COMPLETED";
+      setSimStatus(completionStatus);
+      if (completionStatus === "COMPLETED") {
+        setSimProgressPct(100.0);
+      }
+      if (p) {
+        setPerformanceMetrics((prev) => {
+          const m = p.metrics || {};
+          const base: SimulationPerformanceMetrics = prev || {
+            simulationId: event.simulation_id,
+            initialCapital: m.initial_capital ?? 100000,
+            finalPortfolioValue: p.final_portfolio_value,
+            grossPnl: m.gross_pnl ?? 0,
+            netPnl: m.net_pnl ?? 0,
+            totalReturnPct: p.total_return_pct,
+            transactionCosts: m.transaction_costs ?? 0,
+            slippageCost: m.slippage_cost ?? 0,
+            totalTrades: m.total_trades ?? 0,
+            winningTrades: m.winning_trades ?? 0,
+            losingTrades: m.losing_trades ?? 0,
+            winRatePct: m.win_rate_pct ?? 0,
+            averageWin: m.average_win ?? 0,
+            averageLoss: m.average_loss ?? 0,
+            profitFactor: m.profit_factor ?? 0,
+            maxDrawdownPct: m.max_drawdown_pct ?? 0,
+            exposurePct: m.exposure_pct ?? 0,
+            openPositionsCount: m.open_positions_count ?? 0,
+          };
+          return {
+            ...base,
+            initialCapital: m.initial_capital ?? base.initialCapital,
+            finalPortfolioValue: p.final_portfolio_value,
+            grossPnl: m.gross_pnl ?? base.grossPnl,
+            netPnl: m.net_pnl ?? base.netPnl,
+            totalReturnPct: p.total_return_pct,
+            transactionCosts: m.transaction_costs ?? base.transactionCosts,
+            slippageCost: m.slippage_cost ?? base.slippageCost,
+            totalTrades: m.total_trades ?? base.totalTrades,
+            winningTrades: m.winning_trades ?? base.winningTrades,
+            losingTrades: m.losing_trades ?? base.losingTrades,
+            winRatePct: m.win_rate_pct ?? base.winRatePct,
+            averageWin: m.average_win ?? base.averageWin,
+            averageLoss: m.average_loss ?? base.averageLoss,
+            profitFactor: m.profit_factor ?? base.profitFactor,
+            maxDrawdownPct: m.max_drawdown_pct ?? base.maxDrawdownPct,
+            exposurePct: m.exposure_pct ?? base.exposurePct,
+            openPositionsCount: m.open_positions_count ?? base.openPositionsCount,
+          };
+        });
+      }
+    } else if (event.event_type === "error") {
+      setSimStatus("ERROR");
+      const p = event.payload as any;
+      setSimErrorMessage(p?.message || p?.code || "Simulation execution error");
+    }
+
 
     switch (event.event_type) {
       case "initial_state": {
         const p = event.payload as InitialStatePayload;
         if (p) {
+          setSimStatus((p.status as SimulationLifecycleStatus) || "CREATED");
+          setSimStepIndex(p.step_index ?? 0);
+          setSimCurrentTime(p.current_time ?? null);
           if (p.symbol && p.symbol !== selectedSymbol) {
             setSelectedSymbol(p.symbol);
           }
@@ -130,6 +312,14 @@ export default function TerminalPage() {
       case "candle_update": {
         const p = event.payload as CandleUpdatePayload;
         if (p && p.candle) {
+          setSimStepIndex(p.step_index);
+          setSimCurrentTime(p.candle.timestamp);
+          setSimTotalCandles((prevTotal) => {
+            if (prevTotal > 0) {
+              setSimProgressPct(Math.min(100, (p.step_index / prevTotal) * 100));
+            }
+            return prevTotal;
+          });
           setLiveCandle({
             step_index: p.step_index,
             candle: p.candle,
@@ -223,6 +413,277 @@ export default function TerminalPage() {
     onEvent: handleSimulationEvent,
   });
 
+  // Phase 10D: Fetch initial trades and performance on simulation attach (safe against race conditions)
+  useEffect(() => {
+    const currentSimId = activeSimulationId;
+    if (!currentSimId) {
+      setActivityItems([]);
+      setTradeLogEntries([]);
+      setPerformanceMetrics(null);
+      return;
+    }
+
+    let isCurrent = true;
+
+    fetchSimulationTrades(currentSimId)
+      .then((trades) => {
+        if (!isCurrent) return;
+        if (trades && trades.length > 0) {
+          const restEntries = trades.map(formatApiTradeToLogEntry);
+          setTradeLogEntries((prev) => {
+            // Map existing trades by ID
+            const tradeMap = new Map<string, TradeLogEntry>();
+            for (const restT of restEntries) {
+              tradeMap.set(restT.id, restT);
+            }
+            // Overlay newer live trades from prev
+            for (const liveT of prev) {
+              const existing = tradeMap.get(liveT.id);
+              if (!existing) {
+                tradeMap.set(liveT.id, liveT);
+              } else {
+                // If REST has closed settlement data, keep authoritative exitPrice/netPnl
+                tradeMap.set(liveT.id, {
+                  ...liveT,
+                  exitPrice: existing.exitPrice ?? liveT.exitPrice,
+                  netPnl: existing.netPnl ?? liveT.netPnl,
+                  grossPnl: existing.grossPnl ?? liveT.grossPnl,
+                  isClosed: existing.isClosed || liveT.isClosed,
+                  status: existing.isClosed ? "CLOSED" : liveT.status,
+                });
+              }
+            }
+            return Array.from(tradeMap.values());
+          });
+        }
+      })
+      .catch((err) => {
+        if (isCurrent) console.warn("Failed to fetch simulation trades:", err);
+      });
+
+    fetchSimulationPerformance(currentSimId)
+      .then((perf) => {
+        if (!isCurrent) return;
+        if (perf) {
+          const restMetrics = mapApiPerformanceToMetrics(perf);
+          setPerformanceMetrics((prev) => {
+            if (!prev) return restMetrics;
+            // Preserve newer live portfolio equity and P&L from WebSocket portfolio_updated events
+            return {
+              ...restMetrics,
+              finalPortfolioValue: prev.finalPortfolioValue,
+              grossPnl: prev.grossPnl,
+              netPnl: prev.netPnl,
+              totalReturnPct: prev.totalReturnPct,
+              exposurePct: prev.exposurePct,
+              openPositionsCount: prev.openPositionsCount,
+            };
+          });
+        }
+      })
+      .catch((err) => {
+        if (isCurrent) console.warn("Failed to fetch simulation performance:", err);
+      });
+
+    fetchSimulation(currentSimId)
+      .then((sim) => {
+        if (!isCurrent) return;
+        if (sim) {
+          setSimStatus((prevStatus) => {
+            if (prevStatus === "COMPLETED" || prevStatus === "STOPPED") {
+              return prevStatus;
+            }
+            if (prevStatus === "RUNNING" && sim.status !== "COMPLETED" && sim.status !== "STOPPED") {
+              return prevStatus;
+            }
+            return (sim.status as SimulationLifecycleStatus) || "CREATED";
+          });
+          setSimSpeed((sim.speed as SimulationSpeed) || 1.0);
+          setSimRunMode(sim.is_baseline ? "BASELINE" : "AGENT");
+          setSimStepIndex((prev) => Math.max(prev, sim.step_index));
+          setSimTotalCandles((prev) => Math.max(prev, sim.total_candles));
+          setSimProgressPct((prev) => Math.max(prev, sim.progress_pct));
+          setSimCurrentTime((prev) => {
+            if (!prev) return sim.current_time ?? null;
+            if (sim.current_time && new Date(sim.current_time).getTime() > new Date(prev).getTime()) {
+              return sim.current_time;
+            }
+            return prev;
+          });
+        }
+      })
+      .catch((err) => {
+        if (isCurrent) console.warn("Failed to fetch simulation status:", err);
+      });
+
+    return () => {
+      isCurrent = false;
+    };
+  }, [activeSimulationId]);
+
+  // Phase 10E: Interactive Simulation Control Handlers
+  const handleStartSimulation = async () => {
+    try {
+      setIsSimActionLoading(true);
+      setSimErrorMessage(null);
+      if (!activeSimulationId) {
+        // 1-Click Launch: create and start simulation for active symbol & timeframe
+        const now = new Date();
+        const startDate = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+        const created = await createSimulation({
+          symbol: selectedSymbol,
+          timeframe: selectedTimeframe,
+          start_date: startDate.toISOString(),
+          end_date: now.toISOString(),
+          initial_capital: createdInitialCapital || 100000,
+          is_baseline: simRunMode === "BASELINE",
+          speed: simSpeed,
+        });
+        setActiveSimulationId(created.id);
+        const started = await startSimulation(created.id);
+        setSimStatus((prev) => {
+          if (prev === "COMPLETED" || prev === "STOPPED") return prev;
+          return (started.status as SimulationLifecycleStatus) || "RUNNING";
+        });
+        setSimStepIndex((prev) => Math.max(prev, started.step_index));
+        setSimTotalCandles((prev) => Math.max(prev, started.total_candles));
+        setSimProgressPct((prev) => Math.max(prev, started.progress_pct));
+        setSimCurrentTime((prev) => {
+          if (!prev) return started.current_time ?? null;
+          if (started.current_time && new Date(started.current_time).getTime() > new Date(prev).getTime()) {
+            return started.current_time;
+          }
+          return prev;
+        });
+      } else {
+        const started = await startSimulation(activeSimulationId);
+        setSimStatus((prev) => {
+          if (prev === "COMPLETED" || prev === "STOPPED") return prev;
+          return (started.status as SimulationLifecycleStatus) || "RUNNING";
+        });
+        setSimStepIndex((prev) => Math.max(prev, started.step_index));
+        setSimTotalCandles((prev) => Math.max(prev, started.total_candles));
+        setSimProgressPct((prev) => Math.max(prev, started.progress_pct));
+        setSimCurrentTime((prev) => {
+          if (!prev) return started.current_time ?? null;
+          if (started.current_time && new Date(started.current_time).getTime() > new Date(prev).getTime()) {
+            return started.current_time;
+          }
+          return prev;
+        });
+      }
+    } catch (err: any) {
+      setSimErrorMessage(err?.message || "Failed to start simulation");
+    } finally {
+      setIsSimActionLoading(false);
+    }
+  };
+
+  const handlePauseSimulation = async () => {
+    if (!activeSimulationId) return;
+    try {
+      setIsSimActionLoading(true);
+      setSimErrorMessage(null);
+      const paused = await pauseSimulation(activeSimulationId);
+      setSimStatus((paused.status as SimulationLifecycleStatus) || "PAUSED");
+    } catch (err: any) {
+      setSimErrorMessage(err?.message || "Failed to pause simulation");
+    } finally {
+      setIsSimActionLoading(false);
+    }
+  };
+
+  const handleResumeSimulation = async () => {
+    if (!activeSimulationId) return;
+    try {
+      setIsSimActionLoading(true);
+      setSimErrorMessage(null);
+      const resumed = await resumeSimulation(activeSimulationId);
+      setSimStatus((resumed.status as SimulationLifecycleStatus) || "RUNNING");
+    } catch (err: any) {
+      setSimErrorMessage(err?.message || "Failed to resume simulation");
+    } finally {
+      setIsSimActionLoading(false);
+    }
+  };
+
+  const handleStepSimulation = async () => {
+    if (!activeSimulationId) return;
+    try {
+      setIsSimActionLoading(true);
+      setSimErrorMessage(null);
+      const stepped = await stepSimulation(activeSimulationId);
+      setSimStatus((stepped.status as SimulationLifecycleStatus) || "PAUSED");
+      setSimStepIndex(stepped.step_index);
+      setSimTotalCandles(stepped.total_candles);
+      setSimProgressPct(stepped.progress_pct);
+      setSimCurrentTime(stepped.current_time ?? null);
+    } catch (err: any) {
+      setSimErrorMessage(err?.message || "Failed to step simulation");
+    } finally {
+      setIsSimActionLoading(false);
+    }
+  };
+
+  const handleStopSimulation = async () => {
+    if (!activeSimulationId) return;
+    try {
+      setIsSimActionLoading(true);
+      setSimErrorMessage(null);
+      const stopped = await stopSimulation(activeSimulationId);
+      setSimStatus((stopped.status as SimulationLifecycleStatus) || "STOPPED");
+    } catch (err: any) {
+      setSimErrorMessage(err?.message || "Failed to stop simulation");
+    } finally {
+      setIsSimActionLoading(false);
+    }
+  };
+
+  const handleResetSimulation = async () => {
+    if (!activeSimulationId) return;
+    try {
+      setIsSimActionLoading(true);
+      setSimErrorMessage(null);
+      const reset = await resetSimulation(activeSimulationId);
+      setSimStatus((reset.status as SimulationLifecycleStatus) || "CREATED");
+      setSimStepIndex(0);
+      setSimProgressPct(0);
+      setSimCurrentTime(reset.current_time ?? null);
+      setChartMarkers([]);
+      setActivityItems([]);
+      setTradeLogEntries([]);
+      setPerformanceMetrics(null);
+      setLiveCandle(null);
+      loadMarketAndIndicators(selectedSymbol, selectedTimeframe);
+    } catch (err: any) {
+      setSimErrorMessage(err?.message || "Failed to reset simulation");
+    } finally {
+      setIsSimActionLoading(false);
+    }
+  };
+
+  const handleSpeedChange = async (newSpeed: SimulationSpeed) => {
+    setSimSpeed(newSpeed);
+    if (activeSimulationId) {
+      try {
+        setIsSimActionLoading(true);
+        setSimErrorMessage(null);
+        await setSimulationSpeed(activeSimulationId, newSpeed);
+      } catch (err: any) {
+        setSimErrorMessage(err?.message || "Failed to update playback speed");
+      } finally {
+        setIsSimActionLoading(false);
+      }
+    }
+  };
+
+  const handleRunModeChange = (newMode: SimulationRunMode) => {
+    if (activeSimulationId && simStatus !== "IDLE") return;
+    setSimRunMode(newMode);
+  };
+
+
+
   const handleAgentCreateSubmit = async (payload: AgentMandateCreateRequest) => {
     const resp = await generateAgentMandate(payload);
     if (resp.success && resp.mandate) {
@@ -303,14 +764,35 @@ export default function TerminalPage() {
     }
   }, []);
 
+  // Synchronize authoritative market regime with Agent Live Panel when snapshot loads
+  useEffect(() => {
+    if (indicatorSnapshot) {
+      setAgentLiveState((prev) => ({
+        ...prev,
+        regime: {
+          trend: indicatorSnapshot.trend_regime ?? null,
+          volatility: indicatorSnapshot.volatility_regime ?? null,
+        },
+      }));
+    }
+  }, [indicatorSnapshot]);
+
   useEffect(() => {
     // Clear instrument-specific chart state when switching symbol or timeframe
     setChartMarkers([]);
     setActiveStopLoss(null);
     setActiveTakeProfit(null);
     setLiveCandle(null);
+    setAgentLiveState(
+      createInitialAgentLiveState({
+        simulationId: activeSimulationId,
+        agentName: activeMandate ? createdAgentName : `${selectedSymbol} Quantitative Agent`,
+        strategyStyle: activeMandate ? activeMandate.strategy_style : "MOMENTUM",
+        regime: null, // Reset to null so old symbol's regime is never displayed while loading new symbol
+      })
+    );
     loadMarketAndIndicators(selectedSymbol, selectedTimeframe);
-  }, [selectedSymbol, selectedTimeframe, loadMarketAndIndicators]);
+  }, [selectedSymbol, selectedTimeframe, loadMarketAndIndicators, activeSimulationId, activeMandate, createdAgentName]);
 
   const symbolList =
     instruments.length > 0
@@ -403,6 +885,27 @@ export default function TerminalPage() {
                   setActiveStopLoss(null);
                   setActiveTakeProfit(null);
                   setLiveCandle(null);
+                  setActivityItems([]);
+                  setTradeLogEntries([]);
+                  setPerformanceMetrics(null);
+                  setSimStatus("IDLE");
+                  setSimStepIndex(0);
+                  setSimTotalCandles(0);
+                  setSimProgressPct(0.0);
+                  setSimCurrentTime(null);
+                  setSimErrorMessage(null);
+                  setAgentLiveState(
+                    createInitialAgentLiveState({
+                      agentName: activeMandate ? createdAgentName : `${selectedSymbol} Quantitative Agent`,
+                      strategyStyle: activeMandate ? activeMandate.strategy_style : "MOMENTUM",
+                      regime: indicatorSnapshot
+                        ? {
+                            trend: indicatorSnapshot.trend_regime ?? null,
+                            volatility: indicatorSnapshot.volatility_regime ?? null,
+                          }
+                        : null,
+                    })
+                  );
                 }}
                 title="Detach simulation and return to standalone market view"
                 className="text-slate-400 hover:text-rose-400 ml-1 cursor-pointer"
@@ -436,6 +939,31 @@ export default function TerminalPage() {
       <main className="flex-1 flex overflow-hidden">
         {/* Left / Center: Candlestick Chart Area */}
         <div className="flex-1 flex flex-col border-r border-[#1e293b] min-w-0">
+          {/* Phase 10E: Interactive Simulation Controls Bar */}
+          <SimulationControlsBar
+            simulationId={activeSimulationId}
+            status={simStatus}
+            speed={simSpeed}
+            runMode={simRunMode}
+            stepIndex={simStepIndex}
+            totalCandles={simTotalCandles}
+            progressPct={simProgressPct}
+            currentTime={simCurrentTime}
+            symbol={selectedSymbol}
+            timeframe={selectedTimeframe}
+            isLoadingAction={isSimActionLoading}
+            errorMessage={simErrorMessage}
+            onStart={handleStartSimulation}
+            onPause={handlePauseSimulation}
+            onResume={handleResumeSimulation}
+            onStep={handleStepSimulation}
+            onStop={handleStopSimulation}
+            onReset={handleResetSimulation}
+            onSpeedChange={handleSpeedChange}
+            onRunModeChange={handleRunModeChange}
+            onClearError={() => setSimErrorMessage(null)}
+          />
+
           <div className="flex-1 w-full h-full min-h-0 bg-[#0a0d14] relative">
             <CandlestickChart
               candles={candles}
@@ -449,6 +977,18 @@ export default function TerminalPage() {
               stopLoss={activeStopLoss}
               takeProfit={activeTakeProfit}
               liveCandle={liveCandle}
+            />
+          </div>
+
+          {/* Phase 10D: Bottom Dashboard Workspace (Agent Activity, Trade Log, Performance) */}
+          <div className="border-t border-[#1e293b] shrink-0">
+            <BottomTerminalWorkspace
+              activeTab={bottomTab}
+              onTabChange={setBottomTab}
+              activityItems={activityItems}
+              trades={tradeLogEntries}
+              metrics={performanceMetrics}
+              simulationStatus={agentLiveState.status}
             />
           </div>
 
@@ -482,6 +1022,9 @@ export default function TerminalPage() {
 
         {/* Right Sidebar: Market Regime & Quantitative Engine Panel */}
         <aside className="w-84 bg-[#131a27] p-3.5 flex flex-col space-y-3.5 shrink-0 overflow-y-auto border-l border-[#1e293b]">
+          {/* Phase 10C: Agent Live Panel */}
+          <AgentLivePanel state={agentLiveState} />
+
           {/* Market Regime Card */}
           <MarketRegimeCard
             regime={
@@ -589,8 +1132,19 @@ export default function TerminalPage() {
               <button
                 onClick={() => {
                   if (attachInputId.trim()) {
-                    setActiveSimulationId(attachInputId.trim());
+                    const newSimId = attachInputId.trim();
+                    setActiveSimulationId(newSimId);
                     setChartMarkers([]);
+                    setActivityItems([]);
+                    setTradeLogEntries([]);
+                    setPerformanceMetrics(null);
+                    setAgentLiveState(
+                      createInitialAgentLiveState({
+                        simulationId: newSimId,
+                        agentName: activeMandate ? createdAgentName : `${selectedSymbol} Quantitative Agent`,
+                        strategyStyle: activeMandate ? activeMandate.strategy_style : "MOMENTUM",
+                      })
+                    );
                     setIsAttachModalOpen(false);
                     setAttachInputId("");
                   }
@@ -627,6 +1181,12 @@ export default function TerminalPage() {
         }}
         onConfirm={async (confirmed: ConfirmedAgentMandate) => {
           setActiveMandate(confirmed.mandate);
+          setCreatedAgentName(confirmed.agent_name);
+          setAgentLiveState((prev) => ({
+            ...prev,
+            agentName: confirmed.agent_name,
+            strategyStyle: confirmed.mandate.strategy_style,
+          }));
           setIsReviewModalOpen(false);
         }}
       />
